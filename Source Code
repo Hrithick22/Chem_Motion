@@ -1,0 +1,892 @@
+"""
+================================================================================
+  ChemMotion v2 - Sketch & Motion Studio with Chemistry Templates
+  A 2D animation tool for chemistry video creators.
+
+  FEATURES:
+  - Draw: Pen, Line, Arrow, Circle, Filled Dot, Rectangle, Text
+  - Move: Keyframe-based motion with smooth tweening
+  - Orbit: Auto-generate circular orbit keyframes (electrons!)
+  - Fade:  Fade objects in/out with opacity keyframes
+  - Templates: One-click atoms, electrons, bonds, arrows, orbitals
+  - Export: Animated GIF at 960x540 (16:9)
+
+  HOW TO RUN:
+      pip install pillow
+      python chem_motion_v2.py
+
+  QUICK WORKFLOW:
+  1. Use the Templates panel (left) to stamp atoms & electrons onto the canvas.
+  2. Switch to SELECT tool. Drag the timeline to a later frame.
+  3. Drag objects to animate them (keyframes are auto-set).
+  4. Use "Add Orbit" to make electrons orbit a nucleus.
+  5. Use "Fade In / Fade Out" to make bonds or labels appear/disappear.
+  6. Press PLAY to preview. Click EXPORT GIF when happy.
+================================================================================
+"""
+
+import json
+import math
+import tkinter as tk
+from tkinter import ttk, colorchooser, filedialog, simpledialog, messagebox
+
+from PIL import Image, ImageDraw, ImageFont
+
+CANVAS_W, CANVAS_H = 960, 540
+BG       = "#1e1e28"
+PANEL    = "#2a2a38"
+SIDEBAR  = "#252533"
+TEXT     = "#e9ecef"
+ACCENT   = "#4dabf7"
+MUTED    = "#9aa0aa"
+
+# ── Chemistry colour palette ────────────────────────────────────────────────
+ATOM_COLORS = {
+    "H": "#FFFFFF", "He": "#D9FFFF", "Li": "#CC80FF", "Be": "#C2FF00",
+    "B": "#FFB5B5", "C": "#404040", "N": "#3050F8", "O": "#FF0D0D",
+    "F": "#90E050", "Ne": "#B3E3F5", "Na": "#AB5CF2", "Mg": "#8AFF00",
+    "Al": "#BFA6A6", "Si": "#F0C8A0", "P": "#FF8000", "S": "#FFFF30",
+    "Cl": "#1FF01F", "Ar": "#80D1E3", "K": "#8F40D4", "Ca": "#3DFF00",
+    "Fe": "#E06633", "Cu": "#C88033", "Zn": "#7D80B0", "Br": "#A62929",
+    "Ag": "#C0C0C0", "I": "#940094", "Au": "#FFD123",
+}
+
+
+# ============================================================================
+#  PURE LOGIC (no Tkinter)
+# ============================================================================
+def lerp(a, b, t):
+    return a + (b - a) * t
+
+
+def offset_at(obj, frame):
+    """Interpolated (dx, dy) offset at a given frame."""
+    kfs = obj["keyframes"]
+    if not kfs:
+        return (0.0, 0.0)
+    frames = sorted(kfs)
+    if frame <= frames[0]:
+        return tuple(kfs[frames[0]])
+    if frame >= frames[-1]:
+        return tuple(kfs[frames[-1]])
+    for i in range(len(frames) - 1):
+        a, b = frames[i], frames[i + 1]
+        if a <= frame <= b:
+            t = (frame - a) / (b - a) if b != a else 0.0
+            ax, ay = kfs[a]
+            bx, by = kfs[b]
+            return (lerp(ax, bx, t), lerp(ay, by, t))
+    return (0.0, 0.0)
+
+
+def opacity_at(obj, frame):
+    """Interpolated opacity (0.0-1.0) at a given frame."""
+    okf = obj.get("opacity_kf", {})
+    if not okf:
+        return 1.0
+    frames = sorted(okf)
+    if frame <= frames[0]:
+        return okf[frames[0]]
+    if frame >= frames[-1]:
+        return okf[frames[-1]]
+    for i in range(len(frames) - 1):
+        a, b = frames[i], frames[i + 1]
+        if a <= frame <= b:
+            t = (frame - a) / (b - a) if b != a else 0.0
+            return lerp(okf[a], okf[b], t)
+    return 1.0
+
+
+def shifted_points(obj, frame):
+    dx, dy = offset_at(obj, frame)
+    return [(x + dx, y + dy) for (x, y) in obj["points"]]
+
+
+def blend_color(hex_color, opacity, bg_hex="#ffffff"):
+    """Blend a colour toward background based on opacity."""
+    if opacity >= 1.0:
+        return hex_color
+    r, g, b = int(hex_color[1:3], 16), int(hex_color[3:5], 16), int(hex_color[5:7], 16)
+    br, bg_, bb = int(bg_hex[1:3], 16), int(bg_hex[3:5], 16), int(bg_hex[5:7], 16)
+    return "#%02x%02x%02x" % (
+        int(r * opacity + br * (1 - opacity)),
+        int(g * opacity + bg_ * (1 - opacity)),
+        int(b * opacity + bb * (1 - opacity)))
+
+
+def _arrowhead(p_from, p_to, size):
+    x0, y0 = p_from; x1, y1 = p_to
+    ang = math.atan2(y1 - y0, x1 - x0)
+    a1, a2 = ang + math.radians(150), ang - math.radians(150)
+    return ([x1 + size * math.cos(a1), y1 + size * math.sin(a1)],
+            [x1 + size * math.cos(a2), y1 + size * math.sin(a2)])
+
+
+def make_obj(type_, points, color="#4dabf7", width=4, text=""):
+    return {"type": type_, "points": [list(p) for p in points],
+            "color": color, "width": width, "text": text,
+            "keyframes": {0: [0.0, 0.0]}, "opacity_kf": {0: 1.0}}
+
+
+# ── Rendering to Pillow (for GIF export) ──
+def render_to_pil(objects, frame, size=(CANVAS_W, CANVAS_H), bg="white"):
+    img = Image.new("RGB", size, bg)
+    draw = ImageDraw.Draw(img)
+    for obj in objects:
+        opa = opacity_at(obj, frame)
+        if opa < 0.02:
+            continue
+        pts = shifted_points(obj, frame)
+        col = blend_color(obj["color"], opa)
+        w = max(1, int(obj["width"]))
+        t = obj["type"]
+        if t == "pen" and len(pts) >= 2:
+            draw.line(pts, fill=col, width=w, joint="curve")
+        elif t == "line" and len(pts) == 2:
+            draw.line(pts, fill=col, width=w)
+        elif t == "double_line" and len(pts) == 2:
+            _draw_double_bond_pil(draw, pts, col, w)
+        elif t == "triple_line" and len(pts) == 2:
+            _draw_triple_bond_pil(draw, pts, col, w)
+        elif t == "rect" and len(pts) == 2:
+            (x0, y0), (x1, y1) = pts
+            draw.rectangle([min(x0,x1), min(y0,y1), max(x0,x1), max(y0,y1)],
+                           outline=col, width=w)
+        elif t == "circle" and len(pts) == 2:
+            (x0, y0), (x1, y1) = pts
+            draw.ellipse([min(x0,x1), min(y0,y1), max(x0,x1), max(y0,y1)],
+                         outline=col, width=w)
+        elif t == "dot" and len(pts) == 2:
+            (x0, y0), (x1, y1) = pts
+            draw.ellipse([min(x0,x1), min(y0,y1), max(x0,x1), max(y0,y1)], fill=col)
+        elif t == "arrow" and len(pts) == 2:
+            draw.line(pts, fill=col, width=w)
+            w1, w2 = _arrowhead(pts[0], pts[1], 10 + w * 2)
+            draw.polygon([pts[1], w1, w2], fill=col)
+        elif t == "curved_arrow" and len(pts) >= 3:
+            _draw_curved_arrow_pil(draw, pts, col, w)
+        elif t == "text" and pts:
+            try:
+                font = ImageFont.truetype("DejaVuSans.ttf", w)
+            except Exception:
+                try:
+                    font = ImageFont.truetype("arial.ttf", w)
+                except Exception:
+                    font = ImageFont.load_default()
+            draw.text(pts[0], obj.get("text", ""), fill=col, font=font)
+    return img
+
+
+def _offset_line(p1, p2, dist):
+    dx, dy = p2[0]-p1[0], p2[1]-p1[1]
+    L = max(1, math.hypot(dx, dy))
+    nx, ny = -dy/L * dist, dx/L * dist
+    return ((p1[0]+nx, p1[1]+ny), (p2[0]+nx, p2[1]+ny))
+
+
+def _draw_double_bond_pil(draw, pts, col, w):
+    gap = max(3, w + 2)
+    a1, a2 = _offset_line(pts[0], pts[1], gap/2)
+    b1, b2 = _offset_line(pts[0], pts[1], -gap/2)
+    draw.line([a1, a2], fill=col, width=w)
+    draw.line([b1, b2], fill=col, width=w)
+
+
+def _draw_triple_bond_pil(draw, pts, col, w):
+    gap = max(4, w + 3)
+    a1, a2 = _offset_line(pts[0], pts[1], gap)
+    b1, b2 = _offset_line(pts[0], pts[1], -gap)
+    draw.line(pts, fill=col, width=w)
+    draw.line([a1, a2], fill=col, width=w)
+    draw.line([b1, b2], fill=col, width=w)
+
+
+def _draw_curved_arrow_pil(draw, pts, col, w):
+    # Draw a smooth curve through the points
+    if len(pts) < 2:
+        return
+    draw.line(pts, fill=col, width=w, joint="curve")
+    # Arrowhead at end
+    if len(pts) >= 2:
+        w1, w2 = _arrowhead(pts[-2], pts[-1], 10 + w * 2)
+        draw.polygon([pts[-1], w1, w2], fill=col)
+
+
+def export_gif(objects, total_frames, fps, path):
+    frames = [render_to_pil(objects, f) for f in range(total_frames)]
+    duration = max(20, int(1000 / max(1, fps)))
+    frames[0].save(path, save_all=True, append_images=frames[1:],
+                   duration=duration, loop=0, disposal=2)
+    return path
+
+
+# ── Orbit keyframe generator ──
+def add_orbit_keyframes(obj, cx, cy, radius, total_frames, revolutions=1):
+    """Set position keyframes so obj orbits (cx,cy) over total_frames."""
+    base = obj["points"][0] if obj["points"] else [cx, cy]
+    bx, by = base[0], base[1]
+    for f in range(total_frames):
+        angle = 2 * math.pi * revolutions * f / total_frames
+        dx = (cx + radius * math.cos(angle)) - bx
+        dy = (cy + radius * math.sin(angle)) - by
+        obj["keyframes"][f] = [dx, dy]
+
+
+# ============================================================================
+#  TEMPLATE DEFINITIONS
+# ============================================================================
+def _atom_objects(symbol, cx, cy, radius=28, color=None):
+    """Return a list of objects forming a labelled atom."""
+    if color is None:
+        color = ATOM_COLORS.get(symbol, "#aaaaaa")
+    # use dark text on light atoms, light text on dark
+    r, g, b = int(color[1:3],16), int(color[3:5],16), int(color[5:7],16)
+    tc = "#111111" if (r+g+b) > 380 else "#ffffff"
+    circle = make_obj("dot",
+                      [[cx-radius, cy-radius], [cx+radius, cy+radius]],
+                      color=color, width=2)
+    label = make_obj("text", [[cx - len(symbol)*6, cy - 10]],
+                     color=tc, width=18, text=symbol)
+    return [circle, label]
+
+
+def _electron_obj(cx, cy, color="#ffd43b"):
+    r = 6
+    return make_obj("dot", [[cx-r, cy-r], [cx+r, cy+r]], color=color, width=2)
+
+
+def _bond_obj(x1, y1, x2, y2, bond_type="line", color="#555555", width=3):
+    return make_obj(bond_type, [[x1,y1],[x2,y2]], color=color, width=width)
+
+
+TEMPLATES = {
+    "Atoms": [
+        ("H", "Hydrogen"),  ("C", "Carbon"),    ("N", "Nitrogen"),
+        ("O", "Oxygen"),    ("Na", "Sodium"),    ("Cl", "Chlorine"),
+        ("S", "Sulfur"),    ("Fe", "Iron"),      ("Ca", "Calcium"),
+        ("K", "Potassium"), ("Mg", "Magnesium"), ("Cu", "Copper"),
+    ],
+    "Particles": [
+        ("e-", "Electron"),  ("p+", "Proton"),  ("n0", "Neutron"),
+    ],
+    "Bonds": [
+        ("single", "Single Bond"),   ("double", "Double Bond"),
+        ("triple", "Triple Bond"),
+    ],
+    "Arrows": [
+        ("rxn_arrow", "Reaction Arrow  \u2192"),
+        ("eq_arrow", "Equilibrium  \u21CC"),
+        ("mech_arrow", "Mechanism Arrow"),
+    ],
+    "Shapes": [
+        ("orbital", "Orbital"),
+        ("nucleus", "Nucleus"),
+        ("plus", "Plus Sign"),
+    ],
+}
+
+
+def create_template(name, cx, cy):
+    """Return a list of drawable objects for a given template name."""
+    objs = []
+    if name in ATOM_COLORS or name in ("Fe","Ca","K","Mg","Cu"):
+        objs = _atom_objects(name, cx, cy)
+    elif name == "e-":
+        objs = [_electron_obj(cx, cy)]
+    elif name == "p+":
+        o = make_obj("dot", [[cx-8,cy-8],[cx+8,cy+8]], color="#ff6b6b", width=2)
+        l = make_obj("text", [[cx-6, cy-9]], color="#ffffff", width=14, text="p\u207A")
+        objs = [o, l]
+    elif name == "n0":
+        o = make_obj("dot", [[cx-8,cy-8],[cx+8,cy+8]], color="#868e96", width=2)
+        l = make_obj("text", [[cx-6, cy-9]], color="#ffffff", width=14, text="n\u2070")
+        objs = [o, l]
+    elif name == "single":
+        objs = [_bond_obj(cx-40, cy, cx+40, cy)]
+    elif name == "double":
+        objs = [_bond_obj(cx-40, cy, cx+40, cy, "double_line")]
+    elif name == "triple":
+        objs = [_bond_obj(cx-40, cy, cx+40, cy, "triple_line")]
+    elif name == "rxn_arrow":
+        objs = [make_obj("arrow", [[cx-60,cy],[cx+60,cy]], color="#333333", width=3)]
+    elif name == "eq_arrow":
+        objs = [make_obj("arrow", [[cx-50,cy-4],[cx+50,cy-4]], color="#333333", width=2),
+                make_obj("arrow", [[cx+50,cy+4],[cx-50,cy+4]], color="#333333", width=2)]
+    elif name == "mech_arrow":
+        pts = []
+        for i in range(20):
+            t = i / 19
+            angle = math.pi * t
+            px = cx - 40 + 80 * t
+            py = cy - 30 * math.sin(angle)
+            pts.append([px, py])
+        objs = [make_obj("curved_arrow", pts, color="#e64980", width=3)]
+    elif name == "orbital":
+        objs = [make_obj("circle", [[cx-35,cy-20],[cx+35,cy+20]],
+                         color="#4dabf7", width=2)]
+    elif name == "nucleus":
+        objs = [make_obj("dot", [[cx-18,cy-18],[cx+18,cy+18]],
+                         color="#e64980", width=2)]
+    elif name == "plus":
+        objs = [make_obj("text", [[cx-8,cy-14]], color="#333333", width=22, text="+")]
+    return objs
+
+
+# ============================================================================
+#  THE APPLICATION
+# ============================================================================
+class ChemMotionApp:
+    def __init__(self, root):
+        self.root = root
+        root.title("ChemMotion v2  \u2014  Sketch & Motion Studio")
+        root.configure(bg=BG)
+
+        self.objects = []
+        self.tool = "select"
+        self.color = "#4dabf7"
+        self.width = 4
+        self.total_frames = 60
+        self.fps = 12
+        self.current_frame = 0
+        self.onion = tk.BooleanVar(value=False)
+        self.selected = None
+        self.playing = False
+        self.canvas = None
+        self._drag = None
+
+        self._build_toolbar()
+        self._build_main_area()
+        self._build_timeline()
+        self._bind_canvas()
+        self.render()
+
+    # ── TOOLBAR ─────────────────────────────────────────────────────────────
+    def _build_toolbar(self):
+        bar = tk.Frame(self.root, bg=PANEL)
+        bar.pack(side="top", fill="x")
+
+        tools = [("Select", "select"), ("Pen", "pen"), ("Line", "line"),
+                 ("Arrow", "arrow"), ("Circle", "circle"), ("Dot", "dot"),
+                 ("Rect", "rect"), ("Text", "text")]
+        self.tool_btns = {}
+        for label, name in tools:
+            b = tk.Button(bar, text=label, width=7, relief="flat",
+                          bg=PANEL, fg=TEXT, activebackground=ACCENT,
+                          command=lambda n=name: self.set_tool(n))
+            b.pack(side="left", padx=1, pady=5)
+            self.tool_btns[name] = b
+
+        sep = tk.Frame(bar, bg="#444", width=2, height=22)
+        sep.pack(side="left", padx=6)
+
+        self.color_btn = tk.Button(bar, text="Colour", width=7, relief="flat",
+                                   bg=self.color, fg="#111",
+                                   command=self.pick_color)
+        self.color_btn.pack(side="left", padx=2)
+
+        tk.Label(bar, text="Size", bg=PANEL, fg=TEXT).pack(side="left", padx=(8,2))
+        self.width_spin = tk.Spinbox(bar, from_=1, to=60, width=3,
+                                     command=self._on_width)
+        self.width_spin.delete(0, "end")
+        self.width_spin.insert(0, str(self.width))
+        self.width_spin.pack(side="left")
+
+        tk.Frame(bar, bg="#444", width=2, height=22).pack(side="left", padx=6)
+
+        for txt, cmd in [("Duplicate", self.duplicate_selected),
+                         ("Delete", self.delete_selected),
+                         ("\u2191 Up", self.layer_up),
+                         ("\u2193 Down", self.layer_down)]:
+            tk.Button(bar, text=txt, width=7, relief="flat", bg=PANEL,
+                      fg=TEXT, command=cmd).pack(side="left", padx=1)
+
+        tk.Button(bar, text="Clear All", width=7, relief="flat", bg=PANEL,
+                  fg="#ff6b6b", command=self.clear_all).pack(side="left", padx=1)
+
+        self.set_tool("select")
+
+    # ── MAIN AREA (sidebar + canvas) ───────────────────────────────────────
+    def _build_main_area(self):
+        main = tk.Frame(self.root, bg=BG)
+        main.pack(side="top", fill="both", expand=True, padx=0, pady=0)
+
+        # ── Template sidebar ──
+        side = tk.Frame(main, bg=SIDEBAR, width=150)
+        side.pack(side="left", fill="y", padx=(8,0), pady=8)
+        side.pack_propagate(False)
+
+        tk.Label(side, text="\u2699 Templates", font=("Segoe UI", 11, "bold"),
+                 bg=SIDEBAR, fg=ACCENT).pack(pady=(8,4))
+
+        # scrollable area
+        sf = tk.Frame(side, bg=SIDEBAR)
+        sf.pack(fill="both", expand=True)
+        scroll_canvas = tk.Canvas(sf, bg=SIDEBAR, highlightthickness=0, width=140)
+        scrollbar = tk.Scrollbar(sf, orient="vertical", command=scroll_canvas.yview)
+        inner = tk.Frame(scroll_canvas, bg=SIDEBAR)
+        inner.bind("<Configure>",
+                   lambda e: scroll_canvas.configure(scrollregion=scroll_canvas.bbox("all")))
+        scroll_canvas.create_window((0, 0), window=inner, anchor="nw")
+        scroll_canvas.configure(yscrollcommand=scrollbar.set)
+        scroll_canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        for category, items in TEMPLATES.items():
+            tk.Label(inner, text=category, font=("Segoe UI", 9, "bold"),
+                     bg=SIDEBAR, fg=MUTED).pack(anchor="w", padx=6, pady=(8,2))
+            for key, label in items:
+                color = ATOM_COLORS.get(key, ACCENT)
+                b = tk.Button(inner, text=label, width=16, anchor="w",
+                              relief="flat", bg=SIDEBAR, fg=TEXT,
+                              activebackground="#3a3a4a",
+                              command=lambda k=key: self.stamp_template(k))
+                b.pack(padx=4, pady=1)
+
+        # ── Canvas ──
+        wrap = tk.Frame(main, bg=BG)
+        wrap.pack(side="left", padx=10, pady=8)
+        self.canvas = tk.Canvas(wrap, width=CANVAS_W, height=CANVAS_H,
+                                bg="white", highlightthickness=1,
+                                highlightbackground="#555")
+        self.canvas.pack()
+
+    # ── TIMELINE ───────────────────────────────────────────────────────────
+    def _build_timeline(self):
+        tl = tk.Frame(self.root, bg=PANEL)
+        tl.pack(side="top", fill="x", ipady=5)
+
+        # Row 1: playback + slider
+        r1 = tk.Frame(tl, bg=PANEL)
+        r1.pack(fill="x", padx=8)
+
+        self.play_btn = tk.Button(r1, text="\u25B6 Play", width=7, relief="flat",
+                                  bg=ACCENT, fg="#111", command=self.toggle_play)
+        self.play_btn.pack(side="left", padx=(0,6))
+
+        self.frame_var = tk.IntVar(value=0)
+        self.slider = tk.Scale(r1, from_=0, to=self.total_frames - 1,
+                               orient="horizontal", length=400,
+                               variable=self.frame_var, showvalue=False,
+                               bg=PANEL, fg=TEXT, troughcolor="#444",
+                               highlightthickness=0, command=self._on_slider)
+        self.slider.pack(side="left", padx=4)
+        self.frame_lbl = tk.Label(r1, text="0 / 59", bg=PANEL, fg=TEXT, width=10)
+        self.frame_lbl.pack(side="left")
+
+        tk.Checkbutton(r1, text="Onion", variable=self.onion,
+                       bg=PANEL, fg=TEXT, selectcolor=PANEL,
+                       activebackground=PANEL, command=self.render
+                       ).pack(side="left", padx=6)
+
+        tk.Label(r1, text="Frames", bg=PANEL, fg=MUTED).pack(side="left", padx=(8,2))
+        self.frames_spin = tk.Spinbox(r1, from_=2, to=600, width=4,
+                                      command=self._on_total_frames)
+        self.frames_spin.delete(0, "end")
+        self.frames_spin.insert(0, str(self.total_frames))
+        self.frames_spin.pack(side="left")
+
+        tk.Label(r1, text="FPS", bg=PANEL, fg=MUTED).pack(side="left", padx=(8,2))
+        self.fps_spin = tk.Spinbox(r1, from_=1, to=60, width=3, command=self._on_fps)
+        self.fps_spin.delete(0, "end")
+        self.fps_spin.insert(0, str(self.fps))
+        self.fps_spin.pack(side="left")
+
+        # Row 2: keyframe + motion + export
+        r2 = tk.Frame(tl, bg=PANEL)
+        r2.pack(fill="x", padx=8, pady=(4,0))
+
+        for txt, cmd in [("Set Key", self.set_keyframe),
+                         ("Del Key", self.del_keyframe),
+                         ("Add Orbit", self.add_orbit),
+                         ("Fade In", self.fade_in),
+                         ("Fade Out", self.fade_out)]:
+            tk.Button(r2, text=txt, width=8, relief="flat", bg=PANEL,
+                      fg=TEXT, command=cmd).pack(side="left", padx=2)
+
+        tk.Frame(r2, bg="#444", width=2, height=20).pack(side="left", padx=8)
+
+        tk.Button(r2, text="Save", width=6, relief="flat", bg=PANEL,
+                  fg=TEXT, command=self.save_project).pack(side="left", padx=2)
+        tk.Button(r2, text="Open", width=6, relief="flat", bg=PANEL,
+                  fg=TEXT, command=self.load_project).pack(side="left", padx=2)
+        tk.Button(r2, text="\u2B07 Export GIF", relief="flat", bg="#69db7c",
+                  fg="#111", width=12, command=self.export).pack(side="left", padx=8)
+
+        self.status = tk.Label(self.root, text="Ready. Use Templates or draw your scene.",
+                               bg=BG, fg=MUTED, anchor="w")
+        self.status.pack(side="top", fill="x", padx=12, pady=(2,6))
+
+    # ── TOOL HANDLERS ──────────────────────────────────────────────────────
+    def set_tool(self, name):
+        self.tool = name
+        for n, b in self.tool_btns.items():
+            b.config(bg=ACCENT if n == name else PANEL,
+                     fg="#111" if n == name else TEXT)
+        if self.canvas:
+            self.canvas.config(cursor="hand2" if name == "select" else "crosshair")
+
+    def pick_color(self):
+        c = colorchooser.askcolor(color=self.color, title="Pick colour")
+        if c and c[1]:
+            self.color = c[1]
+            self.color_btn.config(bg=self.color)
+
+    def _on_width(self):
+        try: self.width = int(self.width_spin.get())
+        except ValueError: pass
+
+    def _on_total_frames(self):
+        try:
+            self.total_frames = max(2, int(self.frames_spin.get()))
+            self.slider.config(to=self.total_frames - 1)
+            if self.current_frame >= self.total_frames:
+                self.current_frame = self.total_frames - 1
+                self.frame_var.set(self.current_frame)
+            self._update_frame_label()
+        except ValueError: pass
+
+    def _on_fps(self):
+        try: self.fps = max(1, int(self.fps_spin.get()))
+        except ValueError: pass
+
+    # ── TIMELINE NAVIGATION ────────────────────────────────────────────────
+    def _on_slider(self, _=None):
+        self.current_frame = self.frame_var.get()
+        self._update_frame_label()
+        self.render()
+
+    def _update_frame_label(self):
+        self.frame_lbl.config(text="%d / %d" %
+                              (self.current_frame, self.total_frames - 1))
+
+    def toggle_play(self):
+        self.playing = not self.playing
+        self.play_btn.config(text="\u23F8 Stop" if self.playing else "\u25B6 Play")
+        if self.playing:
+            self._play_step()
+
+    def _play_step(self):
+        if not self.playing:
+            return
+        self.current_frame = (self.current_frame + 1) % self.total_frames
+        self.frame_var.set(self.current_frame)
+        self._update_frame_label()
+        self.render()
+        self.root.after(int(1000 / max(1, self.fps)), self._play_step)
+
+    # ── CANVAS INTERACTION ─────────────────────────────────────────────────
+    def _bind_canvas(self):
+        self.canvas.bind("<Button-1>", self.on_press)
+        self.canvas.bind("<B1-Motion>", self.on_drag)
+        self.canvas.bind("<ButtonRelease-1>", self.on_release)
+
+    def on_press(self, e):
+        x, y = e.x, e.y
+        if self.tool == "select":
+            self.selected = self._hit_test(x, y)
+            if self.selected is not None:
+                obj = self.objects[self.selected]
+                ox, oy = offset_at(obj, self.current_frame)
+                self._drag = {"start": (x, y), "obj_off": (ox, oy)}
+            self.render()
+        elif self.tool == "text":
+            s = simpledialog.askstring("Text", "Enter text / label:")
+            if s:
+                self.objects.append(make_obj("text", [[x,y]], self.color,
+                                             max(10, self.width*4), s))
+                self.render()
+        else:
+            self._drag = {"start": (x, y), "pts": [[x, y]]}
+
+    def on_drag(self, e):
+        x, y = e.x, e.y
+        if self._drag is None:
+            return
+        if self.tool == "select" and self.selected is not None:
+            sx, sy = self._drag["start"]
+            ox, oy = self._drag["obj_off"]
+            self.objects[self.selected]["keyframes"][self.current_frame] = \
+                [ox + (x - sx), oy + (y - sy)]
+            self.render()
+            self.status.config(text="Keyframe set at frame %d." % self.current_frame)
+        elif self.tool == "pen":
+            self._drag["pts"].append([x, y])
+            self._live_preview()
+        elif self.tool in ("line", "arrow", "rect", "circle", "dot"):
+            self._drag["pts"] = [list(self._drag["start"]), [x, y]]
+            self._live_preview()
+
+    def on_release(self, e):
+        if self._drag is None:
+            return
+        if self.tool == "select":
+            self._drag = None
+            return
+        pts = self._drag.get("pts", [])
+        valid = (self.tool == "pen" and len(pts) >= 2) or \
+                (self.tool != "pen" and len(pts) == 2 and pts[0] != pts[1])
+        if valid:
+            self.objects.append(make_obj(self.tool, pts, self.color, self.width))
+        self._drag = None
+        self.render()
+
+    def _hit_test(self, x, y, threshold=16):
+        best, best_d = None, threshold
+        for i, obj in enumerate(self.objects):
+            for (px, py) in shifted_points(obj, self.current_frame):
+                d = math.hypot(px - x, py - y)
+                if d < best_d:
+                    best, best_d = i, d
+        return best
+
+    # ── TEMPLATES ──────────────────────────────────────────────────────────
+    def stamp_template(self, name):
+        cx, cy = CANVAS_W // 2, CANVAS_H // 2
+        new_objs = create_template(name, cx, cy)
+        self.objects.extend(new_objs)
+        if new_objs:
+            self.selected = len(self.objects) - 1
+        self.set_tool("select")
+        self.render()
+        self.status.config(text="Added: %s. Drag to position." % name)
+
+    # ── KEYFRAMES & MOTION ─────────────────────────────────────────────────
+    def set_keyframe(self):
+        if self.selected is None:
+            self.status.config(text="Select an object first.")
+            return
+        obj = self.objects[self.selected]
+        obj["keyframes"][self.current_frame] = list(offset_at(obj, self.current_frame))
+        self.status.config(text="Keyframe set at frame %d." % self.current_frame)
+        self.render()
+
+    def del_keyframe(self):
+        if self.selected is None: return
+        obj = self.objects[self.selected]
+        if self.current_frame in obj["keyframes"] and self.current_frame != 0:
+            del obj["keyframes"][self.current_frame]
+            self.status.config(text="Keyframe removed at frame %d." % self.current_frame)
+            self.render()
+
+    def add_orbit(self):
+        if self.selected is None:
+            self.status.config(text="Select an object first (e.g. an electron).")
+            return
+        r = simpledialog.askinteger("Orbit Radius", "Radius in pixels:", initialvalue=80,
+                                    minvalue=10, maxvalue=400)
+        if r is None: return
+        cx = simpledialog.askinteger("Orbit Center X",
+                                     "Center X (canvas is 0-%d):" % CANVAS_W,
+                                     initialvalue=CANVAS_W//2)
+        if cx is None: return
+        cy = simpledialog.askinteger("Orbit Center Y",
+                                     "Center Y (canvas is 0-%d):" % CANVAS_H,
+                                     initialvalue=CANVAS_H//2)
+        if cy is None: return
+        add_orbit_keyframes(self.objects[self.selected], cx, cy, r, self.total_frames)
+        self.status.config(text="Orbit keyframes added! Press Play to preview.")
+        self.render()
+
+    def fade_in(self):
+        if self.selected is None:
+            self.status.config(text="Select an object first.")
+            return
+        dur = simpledialog.askinteger("Fade In", "Fade duration (frames):",
+                                      initialvalue=10, minvalue=1, maxvalue=120)
+        if dur is None: return
+        obj = self.objects[self.selected]
+        okf = obj.setdefault("opacity_kf", {})
+        start = max(0, self.current_frame)
+        end = min(self.total_frames - 1, start + dur)
+        okf[start] = 0.0
+        okf[end] = 1.0
+        self.status.config(text="Fade in: frames %d\u2192%d." % (start, end))
+        self.render()
+
+    def fade_out(self):
+        if self.selected is None:
+            self.status.config(text="Select an object first.")
+            return
+        dur = simpledialog.askinteger("Fade Out", "Fade duration (frames):",
+                                      initialvalue=10, minvalue=1, maxvalue=120)
+        if dur is None: return
+        obj = self.objects[self.selected]
+        okf = obj.setdefault("opacity_kf", {})
+        start = max(0, self.current_frame)
+        end = min(self.total_frames - 1, start + dur)
+        okf[start] = 1.0
+        okf[end] = 0.0
+        self.status.config(text="Fade out: frames %d\u2192%d." % (start, end))
+        self.render()
+
+    # ── OBJECT MANAGEMENT ──────────────────────────────────────────────────
+    def duplicate_selected(self):
+        if self.selected is None: return
+        import copy
+        dup = copy.deepcopy(self.objects[self.selected])
+        # offset slightly so it's visible
+        for p in dup["points"]:
+            p[0] += 20; p[1] += 20
+        self.objects.append(dup)
+        self.selected = len(self.objects) - 1
+        self.render()
+        self.status.config(text="Object duplicated.")
+
+    def delete_selected(self):
+        if self.selected is not None:
+            self.objects.pop(self.selected)
+            self.selected = None
+            self.render()
+
+    def layer_up(self):
+        if self.selected is not None and self.selected < len(self.objects) - 1:
+            i = self.selected
+            self.objects[i], self.objects[i+1] = self.objects[i+1], self.objects[i]
+            self.selected = i + 1
+            self.render()
+
+    def layer_down(self):
+        if self.selected is not None and self.selected > 0:
+            i = self.selected
+            self.objects[i], self.objects[i-1] = self.objects[i-1], self.objects[i]
+            self.selected = i - 1
+            self.render()
+
+    def clear_all(self):
+        if self.objects and messagebox.askyesno("Clear", "Delete everything?"):
+            self.objects.clear()
+            self.selected = None
+            self.render()
+
+    # ── RENDERING ──────────────────────────────────────────────────────────
+    def _live_preview(self):
+        self.render()
+        pts = self._drag["pts"]
+        self._draw_obj_on_canvas(make_obj(self.tool, pts, self.color, self.width),
+                                 self.current_frame)
+
+    def render(self):
+        self.canvas.delete("all")
+        if self.onion.get() and self.current_frame > 0:
+            for obj in self.objects:
+                self._draw_obj_on_canvas(obj, self.current_frame - 1, ghost=True)
+        for i, obj in enumerate(self.objects):
+            self._draw_obj_on_canvas(obj, self.current_frame,
+                                     selected=(i == self.selected))
+        self._update_frame_label()
+
+    def _draw_obj_on_canvas(self, obj, frame, selected=False, ghost=False):
+        opa = 0.2 if ghost else opacity_at(obj, frame)
+        if opa < 0.02:
+            return
+        pts = shifted_points(obj, frame)
+        col = blend_color(obj["color"] if not ghost else "#c0c0c0", opa)
+        w = max(1, int(obj["width"]))
+        t = obj["type"]
+        flat = [c for p in pts for c in p]
+
+        if t == "pen" and len(pts) >= 2:
+            self.canvas.create_line(*flat, fill=col, width=w,
+                                    smooth=True, capstyle="round")
+        elif t == "line" and len(pts) == 2:
+            self.canvas.create_line(*flat, fill=col, width=w)
+        elif t == "double_line" and len(pts) == 2:
+            self._draw_double_bond_canvas(pts, col, w)
+        elif t == "triple_line" and len(pts) == 2:
+            self._draw_triple_bond_canvas(pts, col, w)
+        elif t == "arrow" and len(pts) == 2:
+            self.canvas.create_line(*flat, fill=col, width=w,
+                                    arrow="last", arrowshape=(14, 16, 6))
+        elif t == "curved_arrow" and len(pts) >= 3:
+            self.canvas.create_line(*flat, fill=col, width=w,
+                                    smooth=True, capstyle="round",
+                                    arrow="last", arrowshape=(14, 16, 6))
+        elif t == "rect" and len(pts) == 2:
+            self.canvas.create_rectangle(*flat, outline=col, width=w)
+        elif t == "circle" and len(pts) == 2:
+            self.canvas.create_oval(*flat, outline=col, width=w)
+        elif t == "dot" and len(pts) == 2:
+            self.canvas.create_oval(*flat, fill=col, outline=col)
+        elif t == "text" and pts:
+            self.canvas.create_text(pts[0][0], pts[0][1], text=obj.get("text",""),
+                                    fill=col, anchor="nw",
+                                    font=("Segoe UI", max(8, w)))
+        if selected and pts:
+            xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
+            self.canvas.create_rectangle(min(xs)-6, min(ys)-6,
+                                         max(xs)+6, max(ys)+6,
+                                         outline=ACCENT, dash=(4,3))
+            kfs = sorted(obj["keyframes"])
+            okf = sorted(obj.get("opacity_kf", {}).keys())
+            self.status.config(
+                text="Selected  |  pos keys: %s  |  opacity keys: %s" %
+                     (", ".join(map(str, kfs)), ", ".join(map(str, okf)) or "none"))
+
+    def _draw_double_bond_canvas(self, pts, col, w):
+        gap = max(3, w + 2)
+        a1, a2 = _offset_line(pts[0], pts[1], gap/2)
+        b1, b2 = _offset_line(pts[0], pts[1], -gap/2)
+        self.canvas.create_line(a1[0],a1[1],a2[0],a2[1], fill=col, width=w)
+        self.canvas.create_line(b1[0],b1[1],b2[0],b2[1], fill=col, width=w)
+
+    def _draw_triple_bond_canvas(self, pts, col, w):
+        gap = max(4, w + 3)
+        a1, a2 = _offset_line(pts[0], pts[1], gap)
+        b1, b2 = _offset_line(pts[0], pts[1], -gap)
+        self.canvas.create_line(pts[0][0],pts[0][1],pts[1][0],pts[1][1], fill=col, width=w)
+        self.canvas.create_line(a1[0],a1[1],a2[0],a2[1], fill=col, width=w)
+        self.canvas.create_line(b1[0],b1[1],b2[0],b2[1], fill=col, width=w)
+
+    # ── EXPORT & FILES ─────────────────────────────────────────────────────
+    def export(self):
+        if not self.objects:
+            messagebox.showinfo("Empty", "Draw something first.")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".gif", filetypes=[("GIF", "*.gif")],
+            initialfile="animation.gif")
+        if not path: return
+        was = self.playing; self.playing = False
+        self.status.config(text="Exporting %d frames..." % self.total_frames)
+        self.root.update()
+        try:
+            export_gif(self.objects, self.total_frames, self.fps, path)
+            self.status.config(text="Exported: " + path)
+            messagebox.showinfo("Done", "Saved:\n" + path)
+        except Exception as ex:
+            messagebox.showerror("Error", str(ex))
+        self.playing = was
+
+    def save_project(self):
+        path = filedialog.asksaveasfilename(
+            defaultextension=".json", filetypes=[("Project", "*.json")])
+        if not path: return
+        data = {"total_frames": self.total_frames, "fps": self.fps,
+                "objects": self.objects}
+        with open(path, "w") as f: json.dump(data, f)
+        self.status.config(text="Saved: " + path)
+
+    def load_project(self):
+        path = filedialog.askopenfilename(filetypes=[("Project", "*.json")])
+        if not path: return
+        with open(path) as f: data = json.load(f)
+        self.total_frames = data.get("total_frames", 60)
+        self.fps = data.get("fps", 12)
+        objs = []
+        for obj in data.get("objects", []):
+            obj["keyframes"] = {int(k): v for k, v in obj["keyframes"].items()}
+            obj["opacity_kf"] = {int(k): v for k, v in obj.get("opacity_kf", {}).items()}
+            objs.append(obj)
+        self.objects = objs
+        self.selected = None
+        self.current_frame = 0
+        self.frame_var.set(0)
+        self.slider.config(to=self.total_frames - 1)
+        self.render()
+        self.status.config(text="Loaded: " + path)
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    ChemMotionApp(root)
+    root.mainloop()
